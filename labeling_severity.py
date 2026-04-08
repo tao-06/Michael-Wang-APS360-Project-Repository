@@ -115,9 +115,23 @@ def process_dataset(json_path, output_csv, dataset_name):
         # Get bounding box for the ROI (x, y, w, h)
         if cv2.countNonZero(mask) > 0:
             x, y, w, h = cv2.boundingRect(mask)
+            
+            # Expand bounding box by 20%
+            context_factor = 0.2
+            dx = int(w * context_factor)
+            dy = int(h * context_factor)
+            
+            img_h, img_w = image_dims[ann["image_id"]]
+            x1 = max(0, x - dx)
+            y1 = max(0, y - dy)
+            x2 = min(img_w, x + w + dx)
+            y2 = min(img_h, y + h + dy)
+            
+            new_w, new_h = x2 - x1, y2 - y1
+            
             # Store individual ROI entry
             roi_data.append(
-                [image_filenames[ann["image_id"]], ann["id"], label, x, y, w, h]
+                [image_filenames[ann["image_id"]], ann["id"], label, x1, y1, new_w, new_h]
             )
             labels.append(label)
 
@@ -163,6 +177,11 @@ train_labels = process_dataset(train_json, "training_stenosis_rois.csv", "Traini
 val_json = os.path.join(base_path, "val", "annotations", "val.json")
 val_labels = process_dataset(val_json, "validation_stenosis_rois.csv", "Validation")
 
+# Process Testing
+test_json = os.path.join(base_path, "test", "annotations", "test.json")
+test_labels = process_dataset(test_json, "testing_stenosis_rois.csv", "Testing")
+
 # Plot distributions
 plot_distribution(train_labels, "Training Set Distribution")
 plot_distribution(val_labels, "Validation Set Distribution")
+plot_distribution(test_labels, "Testing Set Distribution")

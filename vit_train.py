@@ -2,10 +2,12 @@ import modal
 import os
 
 # --- 1. App and Volume Setup ---
-# Using a different app name so you can see it separately in the dashboard
-app = modal.App("stenosis-resnet-training")
+app = modal.App("stenosis-vit-training")
 data_volume = modal.Volume.from_name("stenosis-data", create_if_missing=True)
 model_volume = modal.Volume.from_name("stenosis-models", create_if_missing=True)
+    
+# Name of the folder where you cloned the MedViT repository locally
+MEDVIT_LOCAL_DIR = "./MedViT_repo" 
 
 # --- 2. Environment Configuration ---
 image = (
@@ -13,28 +15,31 @@ image = (
     .apt_install("libgl1-mesa-glx", "libglib2.0-0")
     .pip_install(
         "torch", "torchvision", "pandas", "opencv-python", 
-        "kagglehub", "numpy", "matplotlib", "tqdm"
+        "kagglehub", "numpy", "matplotlib", "tqdm",
+        "einops", "timm", "grad-cam" # Added grad-cam for visualization
     )
-    # Include resnet_transfer here
-    .add_local_python_source("train_base_csv_attention", "resnet_transfer") 
+    .add_local_python_source("train_base_csv_attention") 
+    # Mount the Vision_Transformer directory and the cloned MedViT repo
+    .add_local_dir("./Vision_Transformer", remote_path="/root/Vision_Transformer")
+    .add_local_dir(MEDVIT_LOCAL_DIR, remote_path="/root/MedViT_repo")
     .add_local_file("training_stenosis_rois.csv", remote_path="/root/training_stenosis_rois.csv")
     .add_local_file("validation_stenosis_rois.csv", remote_path="/root/validation_stenosis_rois.csv")
     .add_local_file("testing_stenosis_rois.csv", remote_path="/root/testing_stenosis_rois.csv")
 )
 
-
-# Configuration for training
+# Configuration for ViT training
 CONFIG = {
     "epochs": 30,
     "batch_size": 16,
-    "learning_rate": 0.001,
+    # ViTs usually prefer a lower learning rate than CNNs when fine-tuning
+    "learning_rate": 1e-4, 
     "checkpoint_interval": 5,
     "save_path": "/root/models", 
 }
 
 @app.function(
     image=image,
-    gpu="T4",
+    gpu="A10G",
     volumes={
         "/data": data_volume,    
         "/root/models": model_volume  
@@ -43,6 +48,12 @@ CONFIG = {
     secrets=[modal.Secret.from_name("kaggle-secret")]
 )
 def train():
+    import sys
+    import os
+    # Add directories to the Python path so the imports inside stenosis_VIT.py resolve properly
+    sys.path.append("/root")
+    sys.path.append("/root/MedViT_repo")
+
     import torch
     import kagglehub
     import torch.nn as nn
@@ -51,18 +62,15 @@ def train():
     from torchvision import transforms 
     import matplotlib.pyplot as plt 
     from tqdm import tqdm           
-    import os
     
-    # Import the ResNet model
-    from resnet_transfer import StenosisResNet 
+    # Import the MedViT model and Dataset
+    from Vision_Transformer.stenosis_VIT import StenosisMedViT
     from train_base_csv_attention import StenosisDataset 
     
     # 1. Paths
-    # Read from the image path
     train_csv = "/root/training_stenosis_rois.csv"
     val_csv = "/root/validation_stenosis_rois.csv"
     
-    # Paths inside the persistent volume
     persistent_data_path = "/data/arcade_images"
     train_img_dir = os.path.join(persistent_data_path, "arcade", "stenosis", "train", "images")
     val_img_dir = os.path.join(persistent_data_path, "arcade", "stenosis", "val", "images")
@@ -81,12 +89,9 @@ def train():
         print("Dataset found in persistent volume! Skipping download.")
     
     print("--- 2. Loading Datasets ---")
-    # ResNet typically expects specific normalization
-    # ImageNet stats: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    # MedViT natively expects 224x224 (or 256x256) image inputs instead of 512x512
     train_transform = transforms.Compose([
-        # Resize is now safe because we square-padded the image first
-        transforms.Resize((512, 512)),
-        # Use Affine instead of ResizedCrop to preserve the "Whole Structure" view
+        transforms.Resize((224, 224)),
         transforms.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1)),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
@@ -95,7 +100,7 @@ def train():
     ])
 
     val_transform = transforms.Compose([
-        transforms.Resize((512, 512)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -103,16 +108,15 @@ def train():
     train_dataset = StenosisDataset(train_csv, train_img_dir, transform=train_transform)
     val_dataset = StenosisDataset(val_csv, val_img_dir, transform=val_transform)
     
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
     
     print(f"Data ready: {len(train_dataset)} train, {len(val_dataset)} val images.")
 
-    print("--- 3. Initializing ResNet Model ---")
+    print("--- 3. Initializing MedViT Model ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Initialize the Transfer Learning model
-    model = StenosisResNet(pretrained=True).to(device)
+    model = StenosisMedViT().to(device)
     
     # Calculate Class Weights
     all_labels = train_dataset.annotations["class"].tolist()
@@ -123,24 +127,18 @@ def train():
     
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     optimizer = optim.Adam(model.parameters(), lr=CONFIG["learning_rate"], weight_decay=1e-4)
-    
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=3)
+    scaler = torch.cuda.amp.GradScaler()
 
-    print(f"--- 4. Starting ResNet Training for {CONFIG['epochs']} epochs ---")
+    print(f"--- 4. Starting MedViT Training for {CONFIG['epochs']} epochs ---")
     best_val_acc = 0.0
     os.makedirs(CONFIG["save_path"], exist_ok=True)
 
-    history = {
-        "train_loss": [],
-        "val_loss": [],
-        "train_acc": [],
-        "val_acc": [],
-        }
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
 
     for epoch in range(CONFIG["epochs"]):
         model.train()
         running_loss = 0.0
-        
         loop = tqdm(train_loader, total=len(train_loader), leave=False)
         train_correct, train_total = 0, 0
         loop.set_description(f"Epoch [{epoch+1}/{CONFIG['epochs']}]")
@@ -149,35 +147,36 @@ def train():
             images, labels = images.to(device), labels.to(device)
             
             optimizer.zero_grad()
-            outputs = model(images)
+            
+            with torch.cuda.amp.autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
             _, predicted = torch.max(outputs.data, 1)
             train_total += labels.size(0)
             train_correct += (predicted == labels).sum().item()
 
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             running_loss += loss.item()
             loop.set_postfix(loss=loss.item())
         
-        # Validation
         model.eval()
-        val_loss = 0.0
-        correct, total = 0, 0
+        val_loss, correct, total = 0.0, 0, 0
         with torch.no_grad():
             for images, labels in val_loader:
                 images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                with torch.cuda.amp.autocast():
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
                 val_loss += loss.item()
 
                 _, predicted = torch.max(outputs.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
         
-        # Calculate metrics
         val_acc = 100 * correct / total
         avg_train_loss = running_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
@@ -191,17 +190,15 @@ def train():
         print(f"Epoch [{epoch+1}/{CONFIG['epochs']}] | Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.2f}% | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_acc:.2f}%")
         scheduler.step(val_acc)
 
-        # Save Best Model (with resnet_ prefix)
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_path = os.path.join(CONFIG["save_path"], "resnet_best_model.pth")
+            best_path = os.path.join(CONFIG["save_path"], "vit_best_model.pth")
             torch.save(model.state_dict(), best_path)
-            print(f"  -> New Best ResNet Saved! ({val_acc:.2f}%)")
+            print(f"  -> New Best MedViT Saved! ({val_acc:.2f}%)")
             model_volume.commit()
         
-        # Periodic Checkpoints (with resnet_ prefix)
         if (epoch + 1) % CONFIG["checkpoint_interval"] == 0:
-            ckpt_path = os.path.join(CONFIG["save_path"], f"resnet_checkpoint_epoch_{epoch+1}.pth")
+            ckpt_path = os.path.join(CONFIG["save_path"], f"vit_checkpoint_epoch_{epoch+1}.pth")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -211,29 +208,25 @@ def train():
 
     # --- 5. Generate and Save Plots ---
     plt.figure(figsize=(12, 5))
-
-    # Plot Loss
     plt.subplot(1, 2, 1)
     plt.plot(history["train_loss"], label='Training Loss')
     plt.plot(history["val_loss"], label='Validation Loss')
-    plt.title('ResNet Loss vs. Epochs')
+    plt.title('MedViT Loss vs. Epochs')
     plt.xlabel('Epoch')
     plt.legend()
 
-    # Plot Accuracy
     plt.subplot(1, 2, 2)
     plt.plot(history["train_acc"], label='Training Accuracy')
     plt.plot(history["val_acc"], label='Validation Accuracy')
-    plt.title('ResNet Accuracy vs. Epochs')
+    plt.title('MedViT Accuracy vs. Epochs')
     plt.xlabel('Epoch')
     plt.legend()
 
-    plot_path = os.path.join(CONFIG["save_path"], "resnet_training_curves.png")
+    plot_path = os.path.join(CONFIG["save_path"], "vit_training_curves.png")
     plt.savefig(plot_path)
     print(f"Plots saved to {plot_path}")
-    
     model_volume.commit()
-    print(f"ResNet Training finished. Best Accuracy: {best_val_acc:.2f}%")
+    print(f"MedViT Training finished. Best Accuracy: {best_val_acc:.2f}%")
 
 @app.function(
     image=image,
@@ -244,14 +237,143 @@ def train():
     },
     timeout=1200,
 )
-def test_resnet():
+def generate_gradcam():
+    import sys
+    import os
+    sys.path.append("/root")
+    sys.path.append("/root/MedViT_repo")
+
+    import torch
+    import torch.nn as nn
+    from torchvision import transforms
+    from torch.utils.data import DataLoader
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+    
+    from Vision_Transformer.stenosis_VIT import StenosisMedViT
+    from train_base_csv_attention import StenosisDataset
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    print("--- 1. Loading Trained MedViT Model ---")
+    model = StenosisMedViT().to(device)
+    model_path = os.path.join(CONFIG["save_path"], "vit_best_model.pth")
+    
+    if not os.path.exists(model_path):
+        print(f"Model not found at {model_path}. Please run training first!")
+        return
+        
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    
+    # MedViT is a hybrid model. We can dynamically find the last Conv2d layer to use for Grad-CAM.
+    last_conv = None
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d):
+            last_conv = module
+            
+    if last_conv is None:
+        print("Could not find a Conv2d layer! Defaulting to entire model (might fail).")
+        target_layers = [model.model]
+    else:
+        target_layers = [last_conv]
+        print(f"Targeting layer for Grad-CAM: {last_conv}")
+        
+    cam = GradCAM(model=model, target_layers=target_layers)
+    
+    print("--- 2. Loading Validation Images ---")
+    val_csv = "/root/validation_stenosis_rois.csv"
+    val_img_dir = "/data/arcade_images/arcade/stenosis/val/images"
+    
+    val_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    val_dataset = StenosisDataset(val_csv, val_img_dir, transform=val_transform)
+    # Shuffle to get a random set of images each time
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=True)
+    
+    print("--- 3. Generating Grad-CAM Visualizations ---")
+    num_images = 5
+    fig, axes = plt.subplots(num_images, 3, figsize=(12, 4 * num_images))
+    class_names = ["<50%", "50-70%", ">70%"]
+    
+    # ImageNet un-normalization constants (to properly display the image)
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(device)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(device)
+    
+    images_processed = 0
+    for images, labels in val_loader:
+        if images_processed >= num_images:
+            break
+            
+        images = images.to(device)
+        labels = labels.to(device)
+        
+        outputs = model(images)
+        _, predicted = torch.max(outputs.data, 1)
+        
+        # Ask Grad-CAM to target the class that the model predicted
+        targets = [ClassifierOutputTarget(predicted.item())]
+        grayscale_cam = cam(input_tensor=images, targets=targets)[0, :]
+        
+        # Unnormalize and prep image for visualization
+        img_display = images[0] * std + mean
+        img_display = img_display.permute(1, 2, 0).cpu().numpy()
+        img_display = np.clip(img_display, 0, 1)
+        
+        visualization = show_cam_on_image(img_display, grayscale_cam, use_rgb=True)
+        
+        ax_orig = axes[images_processed, 0]
+        ax_cam = axes[images_processed, 1]
+        ax_over = axes[images_processed, 2]
+        
+        ax_orig.imshow(img_display)
+        ax_orig.set_title(f"Original\nTrue: {class_names[labels.item()]} | Pred: {class_names[predicted.item()]}")
+        ax_orig.axis("off")
+        
+        ax_cam.imshow(grayscale_cam, cmap="jet")
+        ax_cam.set_title("Grad-CAM Heatmap")
+        ax_cam.axis("off")
+        
+        ax_over.imshow(visualization)
+        ax_over.set_title("Overlay")
+        ax_over.axis("off")
+        
+        images_processed += 1
+        
+    save_path = os.path.join(CONFIG["save_path"], "vit_gradcam_visualizations.png")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    model_volume.commit()
+    print(f"--- 4. Success! Plots saved to {save_path} ---")
+
+@app.function(
+    image=image,
+    gpu="A10G",
+    volumes={
+        "/data": data_volume,    
+        "/root/models": model_volume  
+    },
+    timeout=1200,
+)
+def test_vit():
+    import sys
+    import os
+    sys.path.append("/root")
+    sys.path.append("/root/MedViT_repo")
+
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader
     from torchvision import transforms 
-    import os
     
-    from resnet_transfer import StenosisResNet 
+    from Vision_Transformer.stenosis_VIT import StenosisMedViT
     from train_base_csv_attention import StenosisDataset 
     
     test_csv = "/root/testing_stenosis_rois.csv"
@@ -259,20 +381,20 @@ def test_resnet():
     test_img_dir = os.path.join(persistent_data_path, "arcade", "stenosis", "test", "images")
 
     test_transform = transforms.Compose([
-        transforms.Resize((512, 512)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
     test_dataset = StenosisDataset(test_csv, test_img_dir, transform=test_transform)
-    test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
     
     print(f"Test Data ready: {len(test_dataset)} images.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = StenosisResNet(pretrained=False).to(device)
+    model = StenosisMedViT().to(device)
     
-    model_path = os.path.join(CONFIG["save_path"], "resnet_best_model.pth")
+    model_path = os.path.join(CONFIG["save_path"], "vit_best_model.pth")
     if not os.path.exists(model_path):
         print(f"Model not found at {model_path}! Please run training first.")
         return
@@ -281,19 +403,20 @@ def test_resnet():
     model.eval()
 
     correct, total = 0, 0
-    print("--- Starting ResNet Testing Evaluation ---")
+    print("--- Starting MedViT Testing Evaluation ---")
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-
+            with torch.cuda.amp.autocast():
+                outputs = model(images)
+            
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
     
     test_acc = 100 * correct / total
     
-    print(f"\n--- RESNET TEST SET RESULTS ---")
+    print(f"\n--- MEDVIT TEST SET RESULTS ---")
     print(f"Test Accuracy: {test_acc:.2f}%")
     print("-------------------------------\n")
 

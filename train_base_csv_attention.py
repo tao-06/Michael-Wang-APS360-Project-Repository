@@ -30,16 +30,10 @@ class StenosisDataset(Dataset):
         # 2. Crop using the ROI coordinates from your CSV
         x, y, w, h = int(row["x"]), int(row["y"]), int(row["w"]), int(row["h"])
 
-        # 1. Expand Context (critical for seeing transitions)
-        # Add 20% context so the model sees the "shoulders" of the stenosis
-        context_factor = 0.2
-        dx = int(w * context_factor)
-        dy = int(h * context_factor)
-        
-        y1 = max(0, y - dy)
-        y2 = min(image.shape[0], y + h + dy)
-        x1 = max(0, x - dx)
-        x2 = min(image.shape[1], x + w + dx)
+        y1 = y
+        y2 = y + h
+        x1 = x
+        x2 = x + w
         
         crop = image[y1:y2, x1:x2]
 
